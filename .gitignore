@@ -1,0 +1,11 @@
+*.exe
+*.o
+*.obj
+*.out
+.vscode/
+__pycache__/
+docs/html/
+docs/latex/
+data/dataset_*.csv
+.DS_Store
+Thumbs.db
