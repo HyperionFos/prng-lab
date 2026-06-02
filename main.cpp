@@ -15,6 +15,8 @@
 #include <chrono>
 #include <random>
 #include <string>
+#include <fstream>
+#include <filesystem>
 
 // ============================================================
 //  Параметры эксперимента (по тз)
@@ -310,8 +312,7 @@ double chi_square_uniform(const std::vector<uint32_t>& v,
  * @brief Превратить выборку 64-битных слов в поток бит
  *
  * Берёт n_words чисел от генератора и раскладывает каждое на 64 бита
- * (старший бит первым). Тесты NIST работают именно с битовым потоком,
- * а не с числами.
+ * (старший бит первым). Тесты NIST работают именно с битовым потоком.
  *
  * @tparam Gen тип генератора
  * @param g генератор
@@ -335,8 +336,8 @@ double igamc(double a, double x); // предварительное объявл
 /**
  * @brief Неполная гамма-функция P(a, x) (нижняя), разложение в ряд
  *
- * Вспомогательная функция для вычисления p-value. Используется
- * совместно с igamc. Считается рядом при x < a+1.
+ * Вспомогательная функция для вычисления p-value. Считается рядом
+ * при x < a+1, иначе через igamc.
  *
  * @param a параметр
  * @param x аргумент
@@ -358,12 +359,12 @@ double igam(double a, double x) {
 /**
  * @brief Неполная гамма-функция Q(a, x) (верхняя, дополнительная)
  *
- * Возвращает вероятность, по которой статистика хи-квадрат
- * переводится в p-value. Считается непрерывной дробью при x >= a+1,
- * иначе через igam. Это стандартная функция из библиотеки тестов NIST.
+ * Переводит статистику хи-квадрат в p-value. Считается непрерывной
+ * дробью при x >= a+1, иначе через igam. Стандартная функция из
+ * библиотеки тестов NIST.
  *
- * @param a параметр (обычно половина числа степеней свободы)
- * @param x аргумент (обычно половина статистики)
+ * @param a параметр (половина числа степеней свободы)
+ * @param x аргумент (половина статистики)
  * @return p-value в диапазоне [0, 1]
  */
 double igamc(double a, double x) {
@@ -388,8 +389,6 @@ double igamc(double a, double x) {
 
 /**
  * @brief Уровень значимости для тестов NIST
- *
- * Если p-value теста не меньше ALPHA, тест считается пройденным.
  */
 static const double ALPHA = 0.01;
 
@@ -397,9 +396,7 @@ static const double ALPHA = 0.01;
  * @brief Тест 1 - частотный (monobit)
  *
  * Проверяет, поровну ли в потоке нулей и единиц. Каждый бит переводится
- * в +1 (единица) или -1 (ноль), всё суммируется. При равном количестве
- * нулей и единиц сумма близка к нулю. Сумма нормируется на корень из
- * длины и переводится в p-value через дополнительную функцию ошибок.
+ * в +1 или -1, всё суммируется; при балансе сумма близка к нулю.
  *
  * @param bits битовый поток
  * @return p-value (тест пройден, если p >= ALPHA)
@@ -409,21 +406,15 @@ double test_frequency(const std::vector<int>& bits) {
     for (int b : bits) S += (b ? 1 : -1);
     double n = static_cast<double>(bits.size());
     double s_obs = std::fabs(static_cast<double>(S)) / std::sqrt(n);
-    double p = std::erfc(s_obs / std::sqrt(2.0));
-    return p;
+    return std::erfc(s_obs / std::sqrt(2.0));
 }
 
 /**
  * @brief Тест 2 - тест серий (runs)
  *
- * Серия - непрерывный блок одинаковых бит. Тест считает число серий
- * (сколько раз поток переключается между 0 и 1) и сравнивает с
- * ожидаемым для случайной последовательности. Слишком много серий -
- * биты чередуются неестественно часто, слишком мало - залипают
- * длинными блоками.
- *
- * Имеет предусловие: доля единиц должна быть близка к 0.5, иначе тест
- * неприменим и возвращает p = 0.
+ * Считает число серий (переключений между 0 и 1) и сравнивает с
+ * ожидаемым для случайной последовательности. Предусловие: доля единиц
+ * близка к 0.5, иначе тест неприменим (p = 0).
  *
  * @param bits битовый поток
  * @return p-value (тест пройден, если p >= ALPHA)
@@ -433,39 +424,28 @@ double test_runs(const std::vector<int>& bits) {
     long ones = 0;
     for (int b : bits) ones += b;
     double pi = ones / n;
-
-    // предусловие применимости теста
     if (std::fabs(pi - 0.5) >= 2.0 / std::sqrt(n)) return 0.0;
-
-    // число серий: считаем переключения между соседними битами
     long V = 1;
     for (size_t i = 1; i < bits.size(); ++i)
         if (bits[i] != bits[i - 1]) V++;
-
     double num = std::fabs(V - 2.0 * n * pi * (1.0 - pi));
     double den = 2.0 * std::sqrt(2.0 * n) * pi * (1.0 - pi);
-    double p = std::erfc(num / den);
-    return p;
+    return std::erfc(num / den);
 }
 
 /**
  * @brief Тест 3 - блочный частотный (block frequency)
  *
  * Делит поток на блоки длиной M бит и проверяет баланс единиц внутри
- * каждого блока. В отличие от частотного теста, ловит локальные
- * перекосы: поток вида "сначала все нули, потом все единицы" имеет
- * баланс 50/50 в целом, но проваливает блочный тест. Отклонения долей
- * единиц от 0.5 по всем блокам сводятся в статистику хи-квадрат и
- * переводятся в p-value через неполную гамма-функцию.
+ * каждого. Ловит локальные перекосы при общем балансе 50/50.
  *
  * @param bits битовый поток
  * @param M длина блока в битах
  * @return p-value (тест пройден, если p >= ALPHA)
  */
 double test_block_frequency(const std::vector<int>& bits, int M = 128) {
-    int N = static_cast<int>(bits.size()) / M; // число блоков
+    int N = static_cast<int>(bits.size()) / M;
     if (N == 0) return 0.0;
-
     double chi2 = 0.0;
     for (int i = 0; i < N; ++i) {
         long ones = 0;
@@ -475,20 +455,15 @@ double test_block_frequency(const std::vector<int>& bits, int M = 128) {
         chi2 += d * d;
     }
     chi2 *= 4.0 * M;
-
-    double p = igamc(N / 2.0, chi2 / 2.0);
-    return p;
+    return igamc(N / 2.0, chi2 / 2.0);
 }
 
 /**
  * @brief Тест 4 - тест на пары бит (serial)
  *
- * Считает, как часто встречается каждый из четырёх 2-битных шаблонов
- * (00, 01, 10, 11). В случайном потоке все четыре пары равновероятны
- * (примерно по 25%). Перекос означает зависимость между соседними
- * битами (например, после нуля чаще идёт ноль) - такой поток неслучаен.
- * Отклонения частот от ожидаемой сводятся в статистику хи-квадрат с
- * тремя степенями свободы.
+ * Считает частоты четырёх 2-битных шаблонов (00, 01, 10, 11). При
+ * случайном потоке они равновероятны; перекос означает зависимость
+ * между соседними битами. Статистика хи-квадрат с 3 степенями свободы.
  *
  * @param bits битовый поток
  * @return p-value (тест пройден, если p >= ALPHA)
@@ -506,20 +481,16 @@ double test_serial(const std::vector<int>& bits) {
         double d = cnt[k] - expected;
         chi2 += d * d / expected;
     }
-    // 4 шаблона - 1 = 3 степени свободы
-    double p = igamc(3.0 / 2.0, chi2 / 2.0);
-    return p;
+    return igamc(3.0 / 2.0, chi2 / 2.0);
 }
 
 /**
  * @brief Тест 5 - накопленные суммы (cumulative sums)
  *
- * Биты переводятся в шаги: 1 -> +1, 0 -> -1. По потоку строится
- * нарастающая сумма (случайное блуждание). У случайной
- * последовательности сумма колеблется около нуля; при перекосе она
- * постепенно уходит в одну сторону. Тест смотрит на максимальное
- * удаление суммы от нуля - большой размах означает неслучайность.
- * P-value считается через стандартное нормальное распределение.
+ * Биты переводятся в шаги +1/-1, строится нарастающая сумма (случайное
+ * блуждание). Тест смотрит на максимальное удаление суммы от нуля -
+ * большой размах означает неслучайность. P-value через нормальное
+ * распределение.
  *
  * @param bits битовый поток
  * @return p-value (тест пройден, если p >= ALPHA)
@@ -532,11 +503,8 @@ double test_cumulative_sums(const std::vector<int>& bits) {
         if (std::labs(S) > z) z = std::labs(S);
     }
     if (z == 0) return 1.0;
-
-    // стандартная нормальная функция распределения через erfc
     auto Phi = [](double x) { return 0.5 * std::erfc(-x / std::sqrt(2.0)); };
     double sq = std::sqrt(n);
-
     double sum1 = 0.0, sum2 = 0.0;
     int start1 = static_cast<int>((-n / z + 1.0) / 4.0);
     int end1   = static_cast<int>(( n / z - 1.0) / 4.0);
@@ -550,7 +518,6 @@ double test_cumulative_sums(const std::vector<int>& bits) {
         sum2 += Phi(((4 * k + 3) * z) / sq);
         sum2 -= Phi(((4 * k + 1) * z) / sq);
     }
-
     double p = 1.0 - sum1 + sum2;
     if (p < 0.0) p = 0.0;
     if (p > 1.0) p = 1.0;
@@ -560,14 +527,13 @@ double test_cumulative_sums(const std::vector<int>& bits) {
 /**
  * @brief Прогон всех пяти тестов NIST для одного метода
  *
- * Генерирует битовый поток нужной длины и прогоняет по нему пять
- * тестов: частотный, серий, блочный частотный, на пары и накопленных
- * сумм. Для каждого печатает p-value и вердикт PASS/FAIL (порог ALPHA).
+ * Генерирует битовый поток и прогоняет по нему пять тестов, печатая
+ * для каждого p-value и вердикт PASS/FAIL (порог ALPHA).
  *
  * @tparam Gen тип генератора
  * @param name название метода
  * @param seed начальная затравка
- * @param n_words сколько 64-битных слов сгенерировать для потока
+ * @param n_words сколько 64-битных слов сгенерировать
  */
 template <class Gen>
 void run_nist_tests(const std::string& name, uint64_t seed, int n_words = 2000) {
@@ -592,6 +558,109 @@ void run_nist_tests(const std::string& name, uint64_t seed, int n_words = 2000) 
               << "  " << (p4 >= ALPHA ? "PASS" : "FAIL") << "\n";
     std::cout << "  5. Cumulative sums      p=" << p5
               << "  " << (p5 >= ALPHA ? "PASS" : "FAIL") << "\n";
+}
+
+/**
+ * @brief Замерить среднее время генерации заданного числа элементов
+ *
+ * Прогоняет генерацию count чисел repeats раз и возвращает среднее
+ * время одного прогона в миллисекундах. Сгенерированные числа
+ * суммируются в sink, чтобы компилятор не выбросил цикл генерации
+ * как не имеющий эффекта (защита от чрезмерной оптимизации).
+ *
+ * @tparam Gen тип генератора
+ * @param seed начальная затравка
+ * @param count сколько чисел генерировать за прогон
+ * @param repeats сколько прогонов усреднить
+ * @return среднее время прогона в миллисекундах
+ */
+template <class Gen>
+double measure_ms(uint64_t seed, long count, int repeats) {
+    volatile uint64_t sink = 0;
+    double total_ms = 0.0;
+    for (int r = 0; r < repeats; ++r) {
+        Gen g(seed + r);
+        auto t0 = std::chrono::high_resolution_clock::now();
+        uint64_t acc = 0;
+        for (long i = 0; i < count; ++i) acc += g.next_u64();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        sink = sink + acc;
+        total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+    (void)sink;
+    return total_ms / repeats;
+}
+
+/**
+ * @brief Замер скорости для стандартного генератора mt19937_64
+ *
+ * Аналог measure_ms для стандартного генератора языка (Вихрь
+ * Мерсенна) - эталон для сравнения.
+ *
+ * @param seed начальная затравка
+ * @param count сколько чисел генерировать
+ * @param repeats сколько прогонов усреднить
+ * @return среднее время прогона в миллисекундах
+ */
+double measure_mt19937(uint64_t seed, long count, int repeats) {
+    volatile uint64_t sink = 0;
+    double total_ms = 0.0;
+    for (int r = 0; r < repeats; ++r) {
+        std::mt19937_64 g(seed + r);
+        auto t0 = std::chrono::high_resolution_clock::now();
+        uint64_t acc = 0;
+        for (long i = 0; i < count; ++i) acc += g();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        sink = sink + acc;
+        total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+    (void)sink;
+    return total_ms / repeats;
+}
+
+/**
+ * @brief Пункт 6: замер скорости генерации и запись в CSV
+ *
+ * Для объёмов 1000..1000000 элементов замеряет среднее время генерации
+ * тремя собственными методами и стандартным mt19937_64. Печатает
+ * таблицу в консоль и пишет timing.csv для построения графиков.
+ *
+ * @param repeats сколько прогонов усреднить на каждый замер
+ */
+void run_timing(int repeats = 10) {
+    const long sizes[] = {1000, 10000, 100000, 1000000};
+    const int n_sizes = 4;
+
+    std::cout << "\n=== Пункт 6: скорость генерации (среднее по "
+              << repeats << " прогонам, мс) ===\n";
+    std::cout << std::fixed << std::setprecision(4);
+    std::cout << std::setw(12) << std::left << "N"
+              << std::setw(14) << "A_ChronoSpl"
+              << std::setw(14) << "B_LCG"
+              << std::setw(14) << "C_Xorshift"
+              << std::setw(14) << "std_mt19937" << "\n";
+
+    std::filesystem::create_directories("data");
+    std::ofstream csv("data/timing.csv");
+    csv << "N,ChronoSplit,CustomLCG,CustomXorshift,mt19937\n";
+
+    for (int i = 0; i < n_sizes; ++i) {
+        long n = sizes[i];
+        double tA = measure_ms<ChronoSplit>(12345, n, repeats);
+        double tB = measure_ms<CustomLCG>(12345, n, repeats);
+        double tC = measure_ms<CustomXorshift>(12345, n, repeats);
+        double tM = measure_mt19937(12345, n, repeats);
+
+        std::cout << std::setw(12) << std::left << n
+                  << std::setw(14) << tA
+                  << std::setw(14) << tB
+                  << std::setw(14) << tC
+                  << std::setw(14) << tM << "\n";
+
+        csv << n << "," << tA << "," << tB << "," << tC << "," << tM << "\n";
+    }
+    csv.close();
+    std::cout << "Saved data/timing.csv\n";
 }
 
 /**
@@ -671,7 +740,7 @@ int main() {
     summary.push_back(run_method<CustomXorshift>("C (CustomXorshift)", 12345));
 
     // сводный вывод по пунктам 3-4
-    std::cout << "\n=== Pynkti 3-4 ===\n";
+    std::cout << "\n=== Сводка по пунктам 3-4 ===\n";
     std::cout << std::fixed << std::setprecision(2);
     std::cout << std::setw(22) << std::left << "Method"
               << std::setw(12) << "avg_mean"
@@ -687,11 +756,10 @@ int main() {
                   << std::setw(12) << m.avg_chi
                   << m.passed << "/" << SAMPLES << "\n";
     }
-    std::cout << "\nTheory (ravnomernoe na [0," << RANGE << ")): "
-              << "srednee = " << (RANGE - 1) / 2.0
-              << ", SKO = " << RANGE / std::sqrt(12.0)
-              << ", CV = 57.74%\n";
-
+    std::cout << "\nТеория (равномерное на [0," << RANGE << ")): "
+              << "среднее=" << (RANGE - 1) / 2.0
+              << ", СКО=" << RANGE / std::sqrt(12.0)
+              << ", CV=57.74%\n";
 
     // пункт 5: тесты NIST
     std::cout << "\n=== Пункт 5: тесты NIST (alpha=" << ALPHA
@@ -699,6 +767,8 @@ int main() {
     run_nist_tests<ChronoSplit>("A (ChronoSplit)", 12345);
     run_nist_tests<CustomLCG>("B (CustomLCG)", 12345);
     run_nist_tests<CustomXorshift>("C (CustomXorshift)", 12345);
+
+    run_timing(10);
 
     return 0;
 }
