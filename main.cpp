@@ -16,11 +16,13 @@
 #include <random>
 #include <string>
 
-//  Параметры эксперимента
+// ============================================================
+//  Параметры эксперимента (по тз)
+// ============================================================
 static const uint32_t RANGE   = 10000; ///< диапазон значений [0, RANGE), >= 5000
-static const int N = 1000;  ///< элементов в выборке, >= 1000
-static const int SAMPLES = 20;    ///< число выборок на метод, >= 20
-static const int BINS = 100;   ///< число интервалов для хи-квадрат
+static const int      N       = 1000;  ///< элементов в выборке, >= 1000
+static const int      SAMPLES = 20;    ///< число выборок на метод, >= 20
+static const int      BINS    = 100;   ///< число интервалов для хи-квадрат
 
 /**
  * @brief Генератор ПСЧ на основе времени (метод A)
@@ -55,7 +57,7 @@ public:
         }
         state = seed * 1099511628211ULL + 0x9E3779B97F4A7C15ULL;
     }
- 
+
     /**
      * @brief Следующее псевдослучайное число
      *
@@ -73,7 +75,7 @@ public:
         z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
         return z ^ (z >> 31);
     }
- 
+
     /**
      * @brief Число в заданном диапазоне
      *
@@ -112,7 +114,7 @@ public:
      */
     explicit CustomLCG(uint64_t seed = 88172645463325252ULL)
         : state(seed) {}
- 
+
     /**
      * @brief Следующее псевдослучайное число
      *
@@ -128,7 +130,7 @@ public:
         state = A * state + C;
         return (hi << 32) | (state >> 32);
     }
- 
+
     /**
      * @brief Число в заданном диапазоне
      *
@@ -170,7 +172,7 @@ public:
         s1 = (seed * 0x2545F4914F6CDD1DULL) ^ 0x123456789ABCDEFULL;
         if (s0 == 0 && s1 == 0) s0 = 1;
     }
- 
+
     /**
      * @brief Следующее псевдослучайное число
      *
@@ -190,7 +192,7 @@ public:
         s1 = x;
         return s1 + y;
     }
- 
+
     /**
      * @brief Число в заданном диапазоне
      *
@@ -202,30 +204,200 @@ public:
     }
 };
 
+/**
+ * @brief Результаты статистики по одной выборке
+ */
+struct Stats {
+    double mean; ///< среднее значение
+    double sd;   ///< среднеквадратичное отклонение (несмещённое)
+    double cv;   ///< коэффициент вариации, %
+};
+
+/**
+ * @brief Итоговая сводка по методу за все выборки
+ */
+struct MethodSummary {
+    std::string name; ///< название метода
+    double avg_mean;  ///< среднее по средним всех выборок
+    double avg_sd;    ///< среднее СКО
+    double avg_cv;    ///< средний коэффициент вариации
+    double avg_chi;   ///< средняя статистика хи-квадрат
+    int    passed;    ///< сколько выборок прошли проверку равномерности
+};
+
+/**
+ * @brief Набрать выборку заданного размера
+ *
+ * @tparam Gen тип генератора
+ * @param g генератор
+ * @param n размер выборки
+ * @param range размер диапазона значений
+ * @return вектор из n чисел в [0, range)
+ */
+template <class Gen>
+std::vector<uint32_t> make_sample(Gen& g, int n, uint32_t range) {
+    std::vector<uint32_t> v(n);
+    for (int i = 0; i < n; ++i) v[i] = g.bounded(range);
+    return v;
+}
+
+/**
+ * @brief Посчитать среднее, СКО и коэффициент вариации
+ *
+ * Среднее - сумма значений делить на количество. СКО по несмещённой
+ * формуле (деление на n-1). Коэффициент вариации - отношение СКО к
+ * среднему в процентах.
+ *
+ * @param v выборка
+ * @return структура Stats
+ */
+Stats compute_stats(const std::vector<uint32_t>& v) {
+    double sum = 0.0;
+    for (uint32_t x : v) sum += x;
+    double mean = sum / v.size();
+
+    double s2 = 0.0;
+    for (uint32_t x : v) {
+        double d = x - mean;
+        s2 += d * d;
+    }
+    double sd = std::sqrt(s2 / (v.size() - 1));
+    double cv = (mean != 0.0) ? (sd / mean * 100.0) : 0.0;
+
+    return { mean, sd, cv };
+}
+
+/**
+ * @brief Критическое значение хи-квадрат для df=99, alpha=0.05
+ */
+static const double CHI2_CRIT_99 = 123.225;
+
+/**
+ * @brief Проверка выборки на равномерность критерием хи-квадрат
+ *
+ * Делит диапазон на bins интервалов, считает попадания в каждый.
+ * При равномерности в каждый интервал попадает ~ n/bins значений.
+ * Статистика суммирует квадраты отклонений от ожидаемой частоты.
+ *
+ * @param v выборка
+ * @param range размер диапазона
+ * @param bins число интервалов
+ * @return значение статистики хи-квадрат
+ */
+double chi_square_uniform(const std::vector<uint32_t>& v,
+                          uint32_t range, int bins) {
+    std::vector<long> obs(bins, 0);
+    uint32_t width = range / bins;
+    for (uint32_t x : v) {
+        int b = static_cast<int>(x / width);
+        if (b >= bins) b = bins - 1;
+        obs[b]++;
+    }
+    double expected = static_cast<double>(v.size()) / bins;
+    double chi2 = 0.0;
+    for (int i = 0; i < bins; ++i) {
+        double d = obs[i] - expected;
+        chi2 += d * d / expected;
+    }
+    return chi2;
+}
+
+/**
+ * @brief Прогон одного метода: SAMPLES выборок, статистика и хи-квадрат
+ *
+ * Для каждой выборки печатает среднее, СКО, коэффициент вариации и
+ * значение хи-квадрат с пометкой о равномерности. В конце печатает
+ * средние по всем выборкам и возвращает сводку.
+ *
+ * @tparam Gen тип генератора
+ * @param name название метода
+ * @param seed начальная затравка
+ * @return сводка MethodSummary
+ */
+template <class Gen>
+MethodSummary run_method(const std::string& name, uint64_t seed) {
+    std::cout << "\n==== " << name << " ====\n";
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << std::setw(4)  << std::left << "#"
+              << std::setw(12) << "mean"
+              << std::setw(12) << "sd"
+              << std::setw(10) << "CV(%)"
+              << std::setw(12) << "chi2"
+              << "uniform?\n";
+
+    Gen g(seed);
+    double acc_mean = 0, acc_sd = 0, acc_cv = 0, acc_chi = 0;
+    int passed = 0;
+
+    for (int s = 0; s < SAMPLES; ++s) {
+        std::vector<uint32_t> v = make_sample(g, N, RANGE);
+        Stats st = compute_stats(v);
+        double chi = chi_square_uniform(v, RANGE, BINS);
+        bool ok = chi < CHI2_CRIT_99;
+        if (ok) passed++;
+
+        acc_mean += st.mean;
+        acc_sd   += st.sd;
+        acc_cv   += st.cv;
+        acc_chi  += chi;
+
+        std::cout << std::setw(4)  << std::left << (s + 1)
+                  << std::setw(12) << st.mean
+                  << std::setw(12) << st.sd
+                  << std::setw(10) << st.cv
+                  << std::setw(12) << chi
+                  << (ok ? "yes" : "NO") << "\n";
+    }
+
+    std::cout << "avg "
+              << std::setw(12) << (acc_mean / SAMPLES)
+              << std::setw(12) << (acc_sd / SAMPLES)
+              << std::setw(10) << (acc_cv / SAMPLES)
+              << std::setw(12) << (acc_chi / SAMPLES)
+              << "passed " << passed << "/" << SAMPLES << "\n";
+
+    return { name,
+             acc_mean / SAMPLES, acc_sd / SAMPLES,
+             acc_cv / SAMPLES,   acc_chi / SAMPLES,
+             passed };
+}
+
 int main() {
     std::cout << "=== LR3: PRNG ===\n";
     std::cout << "RANGE   = " << RANGE   << "\n";
     std::cout << "N       = " << N       << "\n";
     std::cout << "SAMPLES = " << SAMPLES << "\n";
     std::cout << "BINS    = " << BINS    << "\n";
-    
-    // демонстрация метода A
-    ChronoSplit a(52); // фиксированный seed -> воспроизводимо
-    std::cout << "Method A (ChronoSplit), first 10 in [0, " << RANGE << "):\n  ";
-    for (int i = 0; i < 10; ++i) std::cout << a.bounded(RANGE) << " ";
-    std::cout << "\n";
+    std::cout << "chi2 crit (df=" << (BINS - 1) << ", alpha=0.05) = "
+              << CHI2_CRIT_99 << "\n";
 
-    // демонстрация метода B
-    CustomLCG b(41); // фиксированный seed -> воспроизводимо
-    std::cout << "Method B (CustomLCG),  first 10 in [0, " << RANGE << "):\n  ";
-    for (int i = 0; i < 10; ++i) std::cout << b.bounded(RANGE) << " ";
-    std::cout << "\n";
+    // пункты 3-4: статистика и хи-квадрат по SAMPLES выборкам
+    std::vector<MethodSummary> summary;
+    summary.push_back(run_method<ChronoSplit>("A (ChronoSplit)", 12345));
+    summary.push_back(run_method<CustomLCG>("B (CustomLCG)", 12345));
+    summary.push_back(run_method<CustomXorshift>("C (CustomXorshift)", 12345));
 
-    // демонстрация метода C
-    CustomXorshift c(69); // фиксированный seed -> воспроизводимо
-    std::cout << "Method C (CustomXorshift), first 10 in [0, " << RANGE << "):\n  ";
-    for (int i = 0; i < 10; ++i) std::cout << c.bounded(RANGE) << " ";
-    std::cout << "\n";
+    // сводный вывод по пунктам 3-4
+    std::cout << "\n=== Pynkti 3-4 ===\n";
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << std::setw(22) << std::left << "Method"
+              << std::setw(12) << "avg_mean"
+              << std::setw(12) << "avg_sd"
+              << std::setw(10) << "avg_CV%"
+              << std::setw(12) << "avg_chi2"
+              << "uniform\n";
+    for (const auto& m : summary) {
+        std::cout << std::setw(22) << std::left << m.name
+                  << std::setw(12) << m.avg_mean
+                  << std::setw(12) << m.avg_sd
+                  << std::setw(10) << m.avg_cv
+                  << std::setw(12) << m.avg_chi
+                  << m.passed << "/" << SAMPLES << "\n";
+    }
+    std::cout << "\nTheory (ravnomernoe na [0," << RANGE << ")): "
+              << "srednee = " << (RANGE - 1) / 2.0
+              << ", SKO = " << RANGE / std::sqrt(12.0)
+              << ", CV = 57.74%\n";
 
     return 0;
 }
