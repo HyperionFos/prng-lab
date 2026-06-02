@@ -302,6 +302,298 @@ double chi_square_uniform(const std::vector<uint32_t>& v,
     return chi2;
 }
 
+// ============================================================
+//  Инфраструктура для тестов NIST (пункт 5)
+// ============================================================
+
+/**
+ * @brief Превратить выборку 64-битных слов в поток бит
+ *
+ * Берёт n_words чисел от генератора и раскладывает каждое на 64 бита
+ * (старший бит первым). Тесты NIST работают именно с битовым потоком,
+ * а не с числами.
+ *
+ * @tparam Gen тип генератора
+ * @param g генератор
+ * @param n_words сколько 64-битных слов сгенерировать
+ * @return вектор бит (0 и 1) длиной n_words * 64
+ */
+template <class Gen>
+std::vector<int> make_bits(Gen& g, int n_words) {
+    std::vector<int> bits;
+    bits.reserve(static_cast<size_t>(n_words) * 64);
+    for (int i = 0; i < n_words; ++i) {
+        uint64_t w = g.next_u64();
+        for (int b = 63; b >= 0; --b)
+            bits.push_back(static_cast<int>((w >> b) & 1ULL));
+    }
+    return bits;
+}
+
+double igamc(double a, double x); // предварительное объявление
+
+/**
+ * @brief Неполная гамма-функция P(a, x) (нижняя), разложение в ряд
+ *
+ * Вспомогательная функция для вычисления p-value. Используется
+ * совместно с igamc. Считается рядом при x < a+1.
+ *
+ * @param a параметр
+ * @param x аргумент
+ * @return значение P(a, x)
+ */
+double igam(double a, double x) {
+    if (x <= 0.0 || a <= 0.0) return 0.0;
+    if (x > a + 1.0) return 1.0 - igamc(a, x);
+    double ap = a, sum = 1.0 / a, del = sum;
+    for (int n = 0; n < 200; ++n) {
+        ap += 1.0;
+        del *= x / ap;
+        sum += del;
+        if (std::fabs(del) < std::fabs(sum) * 1e-15) break;
+    }
+    return sum * std::exp(-x + a * std::log(x) - std::lgamma(a));
+}
+
+/**
+ * @brief Неполная гамма-функция Q(a, x) (верхняя, дополнительная)
+ *
+ * Возвращает вероятность, по которой статистика хи-квадрат
+ * переводится в p-value. Считается непрерывной дробью при x >= a+1,
+ * иначе через igam. Это стандартная функция из библиотеки тестов NIST.
+ *
+ * @param a параметр (обычно половина числа степеней свободы)
+ * @param x аргумент (обычно половина статистики)
+ * @return p-value в диапазоне [0, 1]
+ */
+double igamc(double a, double x) {
+    if (x <= 0.0 || a <= 0.0) return 1.0;
+    if (x < a + 1.0) return 1.0 - igam(a, x);
+    double b = x + 1.0 - a;
+    double c = 1e30;
+    double d = 1.0 / b;
+    double h = d;
+    for (int i = 1; i < 200; ++i) {
+        double an = -1.0 * i * (i - a);
+        b += 2.0;
+        d = an * d + b; if (std::fabs(d) < 1e-30) d = 1e-30;
+        c = b + an / c;  if (std::fabs(c) < 1e-30) c = 1e-30;
+        d = 1.0 / d;
+        double del = d * c;
+        h *= del;
+        if (std::fabs(del - 1.0) < 1e-15) break;
+    }
+    return std::exp(-x + a * std::log(x) - std::lgamma(a)) * h;
+}
+
+/**
+ * @brief Уровень значимости для тестов NIST
+ *
+ * Если p-value теста не меньше ALPHA, тест считается пройденным.
+ */
+static const double ALPHA = 0.01;
+
+/**
+ * @brief Тест 1 - частотный (monobit)
+ *
+ * Проверяет, поровну ли в потоке нулей и единиц. Каждый бит переводится
+ * в +1 (единица) или -1 (ноль), всё суммируется. При равном количестве
+ * нулей и единиц сумма близка к нулю. Сумма нормируется на корень из
+ * длины и переводится в p-value через дополнительную функцию ошибок.
+ *
+ * @param bits битовый поток
+ * @return p-value (тест пройден, если p >= ALPHA)
+ */
+double test_frequency(const std::vector<int>& bits) {
+    long S = 0;
+    for (int b : bits) S += (b ? 1 : -1);
+    double n = static_cast<double>(bits.size());
+    double s_obs = std::fabs(static_cast<double>(S)) / std::sqrt(n);
+    double p = std::erfc(s_obs / std::sqrt(2.0));
+    return p;
+}
+
+/**
+ * @brief Тест 2 - тест серий (runs)
+ *
+ * Серия - непрерывный блок одинаковых бит. Тест считает число серий
+ * (сколько раз поток переключается между 0 и 1) и сравнивает с
+ * ожидаемым для случайной последовательности. Слишком много серий -
+ * биты чередуются неестественно часто, слишком мало - залипают
+ * длинными блоками.
+ *
+ * Имеет предусловие: доля единиц должна быть близка к 0.5, иначе тест
+ * неприменим и возвращает p = 0.
+ *
+ * @param bits битовый поток
+ * @return p-value (тест пройден, если p >= ALPHA)
+ */
+double test_runs(const std::vector<int>& bits) {
+    double n = static_cast<double>(bits.size());
+    long ones = 0;
+    for (int b : bits) ones += b;
+    double pi = ones / n;
+
+    // предусловие применимости теста
+    if (std::fabs(pi - 0.5) >= 2.0 / std::sqrt(n)) return 0.0;
+
+    // число серий: считаем переключения между соседними битами
+    long V = 1;
+    for (size_t i = 1; i < bits.size(); ++i)
+        if (bits[i] != bits[i - 1]) V++;
+
+    double num = std::fabs(V - 2.0 * n * pi * (1.0 - pi));
+    double den = 2.0 * std::sqrt(2.0 * n) * pi * (1.0 - pi);
+    double p = std::erfc(num / den);
+    return p;
+}
+
+/**
+ * @brief Тест 3 - блочный частотный (block frequency)
+ *
+ * Делит поток на блоки длиной M бит и проверяет баланс единиц внутри
+ * каждого блока. В отличие от частотного теста, ловит локальные
+ * перекосы: поток вида "сначала все нули, потом все единицы" имеет
+ * баланс 50/50 в целом, но проваливает блочный тест. Отклонения долей
+ * единиц от 0.5 по всем блокам сводятся в статистику хи-квадрат и
+ * переводятся в p-value через неполную гамма-функцию.
+ *
+ * @param bits битовый поток
+ * @param M длина блока в битах
+ * @return p-value (тест пройден, если p >= ALPHA)
+ */
+double test_block_frequency(const std::vector<int>& bits, int M = 128) {
+    int N = static_cast<int>(bits.size()) / M; // число блоков
+    if (N == 0) return 0.0;
+
+    double chi2 = 0.0;
+    for (int i = 0; i < N; ++i) {
+        long ones = 0;
+        for (int j = 0; j < M; ++j) ones += bits[i * M + j];
+        double pi = static_cast<double>(ones) / M;
+        double d = pi - 0.5;
+        chi2 += d * d;
+    }
+    chi2 *= 4.0 * M;
+
+    double p = igamc(N / 2.0, chi2 / 2.0);
+    return p;
+}
+
+/**
+ * @brief Тест 4 - тест на пары бит (serial)
+ *
+ * Считает, как часто встречается каждый из четырёх 2-битных шаблонов
+ * (00, 01, 10, 11). В случайном потоке все четыре пары равновероятны
+ * (примерно по 25%). Перекос означает зависимость между соседними
+ * битами (например, после нуля чаще идёт ноль) - такой поток неслучаен.
+ * Отклонения частот от ожидаемой сводятся в статистику хи-квадрат с
+ * тремя степенями свободы.
+ *
+ * @param bits битовый поток
+ * @return p-value (тест пройден, если p >= ALPHA)
+ */
+double test_serial(const std::vector<int>& bits) {
+    long cnt[4] = {0, 0, 0, 0};
+    for (size_t i = 0; i + 1 < bits.size(); ++i) {
+        int pat = (bits[i] << 1) | bits[i + 1];
+        cnt[pat]++;
+    }
+    double total = static_cast<double>(bits.size() - 1);
+    double expected = total / 4.0;
+    double chi2 = 0.0;
+    for (int k = 0; k < 4; ++k) {
+        double d = cnt[k] - expected;
+        chi2 += d * d / expected;
+    }
+    // 4 шаблона - 1 = 3 степени свободы
+    double p = igamc(3.0 / 2.0, chi2 / 2.0);
+    return p;
+}
+
+/**
+ * @brief Тест 5 - накопленные суммы (cumulative sums)
+ *
+ * Биты переводятся в шаги: 1 -> +1, 0 -> -1. По потоку строится
+ * нарастающая сумма (случайное блуждание). У случайной
+ * последовательности сумма колеблется около нуля; при перекосе она
+ * постепенно уходит в одну сторону. Тест смотрит на максимальное
+ * удаление суммы от нуля - большой размах означает неслучайность.
+ * P-value считается через стандартное нормальное распределение.
+ *
+ * @param bits битовый поток
+ * @return p-value (тест пройден, если p >= ALPHA)
+ */
+double test_cumulative_sums(const std::vector<int>& bits) {
+    double n = static_cast<double>(bits.size());
+    long S = 0, z = 0;
+    for (int b : bits) {
+        S += (b ? 1 : -1);
+        if (std::labs(S) > z) z = std::labs(S);
+    }
+    if (z == 0) return 1.0;
+
+    // стандартная нормальная функция распределения через erfc
+    auto Phi = [](double x) { return 0.5 * std::erfc(-x / std::sqrt(2.0)); };
+    double sq = std::sqrt(n);
+
+    double sum1 = 0.0, sum2 = 0.0;
+    int start1 = static_cast<int>((-n / z + 1.0) / 4.0);
+    int end1   = static_cast<int>(( n / z - 1.0) / 4.0);
+    for (int k = start1; k <= end1; ++k) {
+        sum1 += Phi(((4 * k + 1) * z) / sq);
+        sum1 -= Phi(((4 * k - 1) * z) / sq);
+    }
+    int start2 = static_cast<int>((-n / z - 3.0) / 4.0);
+    int end2   = static_cast<int>(( n / z - 1.0) / 4.0);
+    for (int k = start2; k <= end2; ++k) {
+        sum2 += Phi(((4 * k + 3) * z) / sq);
+        sum2 -= Phi(((4 * k + 1) * z) / sq);
+    }
+
+    double p = 1.0 - sum1 + sum2;
+    if (p < 0.0) p = 0.0;
+    if (p > 1.0) p = 1.0;
+    return p;
+}
+
+/**
+ * @brief Прогон всех пяти тестов NIST для одного метода
+ *
+ * Генерирует битовый поток нужной длины и прогоняет по нему пять
+ * тестов: частотный, серий, блочный частотный, на пары и накопленных
+ * сумм. Для каждого печатает p-value и вердикт PASS/FAIL (порог ALPHA).
+ *
+ * @tparam Gen тип генератора
+ * @param name название метода
+ * @param seed начальная затравка
+ * @param n_words сколько 64-битных слов сгенерировать для потока
+ */
+template <class Gen>
+void run_nist_tests(const std::string& name, uint64_t seed, int n_words = 2000) {
+    Gen g(seed);
+    std::vector<int> bits = make_bits(g, n_words);
+
+    double p1 = test_frequency(bits);
+    double p2 = test_runs(bits);
+    double p3 = test_block_frequency(bits, 128);
+    double p4 = test_serial(bits);
+    double p5 = test_cumulative_sums(bits);
+
+    std::cout << "\n==== " << name << "  (" << bits.size() << " bits) ====\n";
+    std::cout << std::fixed << std::setprecision(4);
+    std::cout << "  1. Frequency (monobit)  p=" << p1
+              << "  " << (p1 >= ALPHA ? "PASS" : "FAIL") << "\n";
+    std::cout << "  2. Runs                 p=" << p2
+              << "  " << (p2 >= ALPHA ? "PASS" : "FAIL") << "\n";
+    std::cout << "  3. Block frequency      p=" << p3
+              << "  " << (p3 >= ALPHA ? "PASS" : "FAIL") << "\n";
+    std::cout << "  4. Serial (2-bit)       p=" << p4
+              << "  " << (p4 >= ALPHA ? "PASS" : "FAIL") << "\n";
+    std::cout << "  5. Cumulative sums      p=" << p5
+              << "  " << (p5 >= ALPHA ? "PASS" : "FAIL") << "\n";
+}
+
 /**
  * @brief Прогон одного метода: SAMPLES выборок, статистика и хи-квадрат
  *
@@ -363,6 +655,7 @@ MethodSummary run_method(const std::string& name, uint64_t seed) {
 }
 
 int main() {
+    system("chcp 65001 > nul");
     std::cout << "=== LR3: PRNG ===\n";
     std::cout << "RANGE   = " << RANGE   << "\n";
     std::cout << "N       = " << N       << "\n";
@@ -398,6 +691,14 @@ int main() {
               << "srednee = " << (RANGE - 1) / 2.0
               << ", SKO = " << RANGE / std::sqrt(12.0)
               << ", CV = 57.74%\n";
+
+
+    // пункт 5: тесты NIST
+    std::cout << "\n=== Пункт 5: тесты NIST (alpha=" << ALPHA
+              << ", p>=alpha => PASS) ===\n";
+    run_nist_tests<ChronoSplit>("A (ChronoSplit)", 12345);
+    run_nist_tests<CustomLCG>("B (CustomLCG)", 12345);
+    run_nist_tests<CustomXorshift>("C (CustomXorshift)", 12345);
 
     return 0;
 }
