@@ -627,7 +627,7 @@ double measure_mt19937(uint64_t seed, long count, int repeats) {
  *
  * @param repeats сколько прогонов усреднить на каждый замер
  */
-void run_timing(int repeats = 10) {
+void run_timing(int repeats = 100) {
     const long sizes[] = {1000, 10000, 100000, 1000000};
     const int n_sizes = 4;
 
